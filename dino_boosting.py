@@ -1,7 +1,9 @@
+import sys
 import random
 import logging
 import argparse
 from pathlib import Path
+from functools import partial
 
 import torch
 import numpy as np
@@ -65,9 +67,15 @@ def get_image_embeddings_dino(
     return image_embeddings
 
 
+def log_message(message: str, log_file: str):
+    logger.info(message)
+    with open(log_file, "a") as f:
+        print(message, file=f)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("output_csv")
+    parser.add_argument("output_dir")
     parser.add_argument("--train_csv", default="./data/train.csv")
     parser.add_argument("--test_csv", default="./data/test.csv")
     parser.add_argument("--train_image_dir", default="./data/train_images/")
@@ -85,6 +93,14 @@ if __name__ == "__main__":
     parser.add_argument("--n_iter", type=int, default=1500)
     parser.add_argument("--lr", type=float, default=0.06)
     args = parser.parse_args()
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(exist_ok=True, parents=True)
+    output_csv = output_dir / "predict.csv"
+    output_log = output_dir / "log.txt"
+    with open(output_log, "w") as f:
+        print(" ".join(sys.argv), file=f)
+    log = partial(log_message, log_file=output_log)
 
     logging.basicConfig(level=logging.INFO)
     seed_all(args.seed)
@@ -108,7 +124,7 @@ if __name__ == "__main__":
     )
     train = train.reset_index(drop=True)
     val = val.reset_index(drop=True)
-    logger.info(f"[train/val split] train: {len(train)}; valid: {len(val)}")
+    log(f"[train/val split] train: {len(train)}; valid: {len(val)}")
 
     if args.filter_outlier:
         labels_describe_df = (
@@ -124,9 +140,7 @@ if __name__ == "__main__":
 
     train_masked = train[train_masking].reset_index(drop=True)
     val_masked = val[val_masking].reset_index(drop=True)
-    logger.info(
-        f"[outlier filtering] train: {len(train_masked)}; valid: {len(val_masked)}"
-    )
+    log(f"[outlier filtering] train: {len(train_masked)}; valid: {len(val_masked)}")
 
     if args.use_auxiliary:
         FEATURE_SCALER = StandardScaler()
@@ -211,8 +225,8 @@ if __name__ == "__main__":
 
         r2_col = r2_score(y_curr_val, y_curr_val_pred)
         scores[col] = r2_col
-        logger.info(f"{col} R2: {r2_col}")
-    logger.info(f"Mean R2: {np.mean(list(scores.values()))}")
+        log(f"{col} R2: {r2_col}")
+    log(f"Mean R2: {np.mean(list(scores.values()))}")
 
     submission = pd.DataFrame({"id": test["id"]})
     submission[TARGET_COLUMNS] = 0
@@ -223,6 +237,5 @@ if __name__ == "__main__":
         col_pred = models[col].predict(test_pool)
         submission[col.replace("_mean", "")] = col_pred
 
-    Path(args.output_csv).parent.mkdir(exist_ok=True, parents=True)
-    submission.to_csv(args.output_csv, index=False)
+    submission.to_csv(output_csv, index=False)
     submission.head()
