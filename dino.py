@@ -73,8 +73,8 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--n_valid", type=int, default=4096)
-    parser.add_argument("--filter_low", type=float, default=0.00001)
-    parser.add_argument("--filter_high", type=float, default=0.999)
+    parser.add_argument("--filter_low", type=float, default=0.001)
+    parser.add_argument("--filter_high", type=float, default=0.981)
     parser.add_argument("--batch_size", type=int, default=64)
     args = parser.parse_args()
 
@@ -120,7 +120,7 @@ if __name__ == "__main__":
     emb_dir = Path(args.embedding_dir) / "dinov2_vitg14_reg"
     emb_dir.mkdir(exist_ok=True, parents=True)
     train_emb_path = emb_dir / "train.npy"
-    valid_emb_path = emb_dir / "valid_npy"
+    valid_emb_path = emb_dir / "valid.npy"
     test_emb_path = emb_dir / "test.npy"
 
     if args.recompute_embedding:
@@ -194,7 +194,7 @@ if __name__ == "__main__":
     submission.columns = submission.columns.str.replace("_mean", "")
 
     for i, col in enumerate(TARGET_COLUMNS):
-        test_pool = Pool(test_features_mask_df, embedding_features=["emb"])
+        test_pool = Pool(test_features_mask_df)
         col_pred = models[col].predict(test_pool)
         submission[col.replace("_mean", "")] = col_pred
 
