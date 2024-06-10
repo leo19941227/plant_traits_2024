@@ -1,4 +1,5 @@
 import random
+import logging
 import argparse
 from pathlib import Path
 
@@ -12,6 +13,8 @@ from sklearn.metrics import r2_score
 from catboost import Pool, CatBoostRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
+
+logger = logging.getLogger(__name__)
 
 
 TARGET_COLUMNS = [
@@ -73,21 +76,23 @@ if __name__ == "__main__":
     parser.add_argument("--embedding_dir", default="./embeddings/")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--n_valid", type=int, default=4096)
+    parser.add_argument("--valid_ratio", type=float, default=0.1)
     parser.add_argument("--filter_low", type=float, default=0.001)
     parser.add_argument("--filter_high", type=float, default=0.981)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--use_auxiliary", action="store_true")
+    parser.add_argument("--filter_outlier", action="store_true")
     args = parser.parse_args()
 
+    logging.basicConfig(level=logging.INFO)
     seed_all(args.seed)
 
     train_image_dir = Path(args.train_image_dir)
     test_image_dir = Path(args.test_image_dir)
 
     # load pickled dataframes from a public dataset; split to train-val
-    train0 = pd.read_csv(args.train_csv)
-    train0["file_path"] = train0["id"].apply(
+    train_raw = pd.read_csv(args.train_csv)
+    train_raw["file_path"] = train_raw["id"].apply(
         lambda s: str(train_image_dir / f"{s}.jpeg")
     )
 
@@ -95,38 +100,39 @@ if __name__ == "__main__":
     test["file_path"] = test["id"].apply(lambda s: str(test_image_dir / f"{s}.jpeg"))
     feature_columns = test.columns.values[1:-1]
 
+    n_valid = round(len(train_raw) * args.valid_ratio)
     train, val = train_test_split(
-        train0, test_size=args.n_valid, shuffle=True, random_state=args.seed
+        train_raw, test_size=n_valid, shuffle=True, random_state=args.seed
     )
     train = train.reset_index(drop=True)
     val = val.reset_index(drop=True)
+    logger.info(f"[train/val split] train: {len(train)}; valid: {len(val)}")
 
-    labels_describe_df = (
-        train[TARGET_COLUMNS]
-        .describe(percentiles=[args.filter_low, args.filter_high])
-        .T
+    if args.filter_outlier:
+        labels_describe_df = (
+            train[TARGET_COLUMNS]
+            .describe(percentiles=[args.filter_low, args.filter_high])
+            .T
+        )
+        train_masking = get_mask(train, labels_describe_df)
+        val_masking = get_mask(val, labels_describe_df)
+    else:
+        train_masking = np.ones((len(train),), dtype=bool)
+        val_masking = np.ones((len(val),), dtype=bool)
+
+    train_masked = train[train_masking].reset_index(drop=True)
+    val_masked = val[val_masking].reset_index(drop=True)
+    logger.info(
+        f"[outlier filtering] train: {len(train_masked)}; valid: {len(val_masked)}"
     )
-    # Masks
-    mask_train = get_mask(train, labels_describe_df)
-    mask_val = get_mask(val, labels_describe_df)
-    # Masked DataFrames
-    train_mask = train[mask_train].reset_index(drop=True)
-    val_mask = val[mask_val].reset_index(drop=True)
-
-    for m, subset, full in zip([train_mask, val_mask], ["train", "val"], [train, val]):
-        print(f"===== {subset} shape: {m.shape} =====")
-        n_masked = len(full) - len(m)
-        perc_masked = (n_masked / len(full)) * 100
-        print(f"{subset} \t| # Masked Samples: {n_masked}")
-        print(f"{subset} \t| % Masked Samples: {perc_masked:.3f}%")
 
     if args.use_auxiliary:
         FEATURE_SCALER = StandardScaler()
         train_features_mask = FEATURE_SCALER.fit_transform(
-            train_mask[feature_columns].values.astype(np.float32)
+            train_masked[feature_columns].values.astype(np.float32)
         )
         val_features_mask = FEATURE_SCALER.transform(
-            val_mask[feature_columns].values.astype(np.float32)
+            val_masked[feature_columns].values.astype(np.float32)
         )
         test_features = FEATURE_SCALER.transform(
             test[feature_columns].values.astype(np.float32)
@@ -166,8 +172,8 @@ if __name__ == "__main__":
         np.save(valid_emb_path, np.array(val_image_embeddings))
         np.save(test_emb_path, np.array(test_image_embeddings))
 
-    train_final_feat = np.load(train_emb_path)[mask_train]
-    val_final_feat = np.load(valid_emb_path)[mask_val]
+    train_final_feat = np.load(train_emb_path)[train_masking]
+    val_final_feat = np.load(valid_emb_path)[val_masking]
     test_final_feat = np.load(test_emb_path)
 
     if args.use_auxiliary:
@@ -179,12 +185,12 @@ if __name__ == "__main__":
 
     models = {}
     scores = {}
-    y_train_mask = train_mask[TARGET_COLUMNS].values
-    y_val_mask = val_mask[TARGET_COLUMNS].values
+    y_train_masked = train_masked[TARGET_COLUMNS].values
+    y_val_masked = val_masked[TARGET_COLUMNS].values
 
     for i, col in tqdm(enumerate(TARGET_COLUMNS), total=len(TARGET_COLUMNS)):
-        y_curr = y_train_mask[:, i]
-        y_curr_val = y_val_mask[:, i]
+        y_curr = y_train_masked[:, i]
+        y_curr_val = y_val_masked[:, i]
         train_pool = Pool(train_final_feat, y_curr)
         val_pool = Pool(val_final_feat, y_curr_val)
 
@@ -203,9 +209,8 @@ if __name__ == "__main__":
 
         r2_col = r2_score(y_curr_val, y_curr_val_pred)
         scores[col] = r2_col
-        print(f"Target: {col}, R2: {r2_col:.3f}")
-    # this val score somewhat correlates with submission score bit I didn't really bother
-    print(f"Mean R2: {np.mean(list(scores.values())):.3f}")
+        logger.info(f"{col} R2: {r2_col}")
+    logger.info(f"Mean R2: {np.mean(list(scores.values()))}")
 
     submission = pd.DataFrame({"id": test["id"]})
     submission[TARGET_COLUMNS] = 0
