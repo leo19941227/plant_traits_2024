@@ -91,6 +91,7 @@ if __name__ == "__main__":
 
     test = pd.read_csv(args.test_csv)
     test["file_path"] = test["id"].apply(lambda s: str(test_image_dir / f"{s}.jpeg"))
+    feature_columns = test.columns.values[1:-1]
 
     train, val = train_test_split(
         train0, test_size=args.n_valid, shuffle=True, random_state=args.seed
@@ -140,7 +141,7 @@ if __name__ == "__main__":
         train_image_embeddings = get_image_embeddings_dino(
             model, preprocess, args.batch_size, train, args.device
         )
-        valid_image_embeddings = get_image_embeddings_dino(
+        val_image_embeddings = get_image_embeddings_dino(
             model, preprocess, args.batch_size, val, args.device
         )
         test_image_embeddings = get_image_embeddings_dino(
@@ -148,12 +149,12 @@ if __name__ == "__main__":
         )
 
         np.save(train_emb_path, np.array(train_image_embeddings))
-        np.save(valid_emb_path, np.array(valid_image_embeddings))
+        np.save(valid_emb_path, np.array(val_image_embeddings))
         np.save(test_emb_path, np.array(test_image_embeddings))
 
-    train_image_embeddings = np.load(train_emb_path)[mask_train]
-    val_image_embeddings = np.load(valid_emb_path)[mask_val]
-    test_image_embeddings = np.load(test_emb_path)
+    train_final_feat = np.load(train_emb_path)[mask_train]
+    val_final_feat = np.load(valid_emb_path)[mask_val]
+    test_final_feat = np.load(test_emb_path)
 
     train_features_mask_df = pd.DataFrame(train_image_embeddings)
     val_features_mask_df = pd.DataFrame(val_image_embeddings)
@@ -172,7 +173,7 @@ if __name__ == "__main__":
 
         # tried to tune these parameters but without real success
         model = CatBoostRegressor(
-            iterations=50,
+            iterations=1500,
             learning_rate=0.06,
             loss_function="RMSE",
             verbose=0,
