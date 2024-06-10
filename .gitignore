@@ -1,4 +1,6 @@
 **/data/**
 **/catboost_info/**
 **/embeddings/**
+**/submissions/**
+
 run.sh
