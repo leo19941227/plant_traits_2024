@@ -10,9 +10,12 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 from tqdm import tqdm
+import torch.nn as nn
+import lightning as L
+import torch.nn.functional as F
 from torchvision import transforms
 from sklearn.metrics import r2_score
-from catboost import Pool, CatBoostRegressor
+from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 
@@ -73,6 +76,106 @@ def log_message(message: str, log_file: str):
         print(message, file=f)
 
 
+class Mlp(L.LightningModule):
+    def __init__(
+        self,
+        input_size,
+        hidden_size: int = 768,
+        hidden_layer: int = 3,
+        lr: float = 1.0e-4,
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+        assert hidden_layer >= 1
+        self.lr = lr
+
+        layers = [nn.Linear(input_size, hidden_size), nn.GELU()]
+        for _ in range(hidden_layer - 1):
+            layers.extend([nn.Linear(hidden_size, hidden_size), nn.GELU()])
+        layers.append(nn.Linear(hidden_size, 1))
+        self.layers = nn.Sequential(*layers)
+
+    def forward(self, x):
+        pred = self.layers(x).view(-1)
+        return pred
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        pred = self(x)
+        loss = F.mse_loss(pred, y)
+        self.log("loss", loss, prog_bar=True, on_step=True)
+        return loss
+
+    def predict_step(self, batch, batch_idx):
+        x = batch
+        pred = self(x)
+        return pred
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
+        return optimizer
+
+
+class PlantTraitsDataset(Dataset):
+    def __init__(self, features, labels=None) -> None:
+        super().__init__()
+        self.features = features
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, index):
+        if self.labels is not None:
+            return self.features[index], self.labels[index]
+        else:
+            return self.features[index]
+
+
+def train_mlp(args, embed_size, train_dataset, valid_dataset, test_dataset):
+    model = Mlp(embed_size, args.hidden_size, args.hidden_layer, args.lr)
+
+    def train_collate_fn(samples):
+        features, labels = zip(*samples)
+        features = torch.stack([torch.FloatTensor(f) for f in features], dim=0)
+        labels = torch.FloatTensor(labels)
+        return features, labels
+
+    def infer_collate_fn(samples):
+        features = torch.stack([torch.FloatTensor(f) for f in samples], dim=0)
+        return features
+
+    train_loader = DataLoader(
+        train_dataset,
+        args.batch_size,
+        shuffle=True,
+        collate_fn=train_collate_fn,
+        num_workers=args.num_workers,
+    )
+    valid_loader = DataLoader(
+        valid_dataset,
+        args.batch_size,
+        shuffle=False,
+        collate_fn=infer_collate_fn,
+        num_workers=args.num_workers,
+    )
+    test_laoder = DataLoader(
+        test_dataset,
+        args.batch_size,
+        shuffle=False,
+        collate_fn=infer_collate_fn,
+        num_workers=args.num_workers,
+    )
+
+    trainer = L.Trainer(max_steps=args.n_iter, accelerator="gpu", devices=1)
+    trainer.fit(model=model, train_dataloaders=train_loader)
+    valid_preds = trainer.predict(model=model, dataloaders=valid_loader)
+    test_preds = trainer.predict(model=model, dataloaders=test_laoder)
+    valid_preds = torch.cat(valid_preds)
+    test_preds = torch.cat(test_preds)
+    return valid_preds, test_preds
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("output_dir")
@@ -85,13 +188,16 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--valid_ratio", type=float, default=0.1)
-    parser.add_argument("--filter_outlier", action="store_true")
+    parser.add_argument("--filter_outlier", action="store_false")
     parser.add_argument("--filter_low", type=float, default=0.012)
     parser.add_argument("--filter_high", type=float, default=0.991)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--use_auxiliary", action="store_true")
     parser.add_argument("--n_iter", type=int, default=1500)
-    parser.add_argument("--lr", type=float, default=0.06)
+    parser.add_argument("--lr", type=float, default=1.0e-4)
+    parser.add_argument("--hidden_size", type=int, default=1024)
+    parser.add_argument("--hidden_layer", type=int, default=5)
+    parser.add_argument("--num_workers", type=int, default=6)
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -199,43 +305,36 @@ if __name__ == "__main__":
         val_final_feat = np.concatenate((val_features_mask, val_final_feat), axis=1)
         test_final_feat = np.concatenate((test_features, test_final_feat), axis=1)
 
-    models = {}
     scores = {}
+    all_test_preds = {}
     y_train_masked = train_masked[TARGET_COLUMNS].values
     y_val_masked = val_masked[TARGET_COLUMNS].values
 
     for i, col in tqdm(enumerate(TARGET_COLUMNS), total=len(TARGET_COLUMNS)):
         y_curr = y_train_masked[:, i]
         y_curr_val = y_val_masked[:, i]
-        train_pool = Pool(train_final_feat, y_curr)
-        val_pool = Pool(val_final_feat, y_curr_val)
 
-        # tried to tune these parameters but without real success
-        model = CatBoostRegressor(
-            iterations=args.n_iter,
-            learning_rate=args.lr,
-            loss_function="RMSE",
-            verbose=0,
-            random_state=args.seed,
+        train_dataset = PlantTraitsDataset(train_final_feat, y_curr)
+        valid_dataset = PlantTraitsDataset(val_final_feat)
+        test_dataset = PlantTraitsDataset(test_final_feat)
+
+        valid_preds, test_preds = train_mlp(
+            args, train_final_feat.shape[1], train_dataset, valid_dataset, test_dataset
         )
-        model.fit(train_pool)
-        models[col] = model
 
-        y_curr_val_pred = model.predict(val_pool)
-
-        r2_col = r2_score(y_curr_val, y_curr_val_pred)
+        r2_col = r2_score(y_curr_val, valid_preds.tolist())
         scores[col] = r2_col
         log(f"{col} R2: {r2_col}")
+
+        all_test_preds[col] = test_preds.tolist()
+
     log(f"Mean R2: {np.mean(list(scores.values()))}")
 
+    # prepare final submission file
     submission = pd.DataFrame({"id": test["id"]})
     submission[TARGET_COLUMNS] = 0
     submission.columns = submission.columns.str.replace("_mean", "")
-
     for i, col in enumerate(TARGET_COLUMNS):
-        test_pool = Pool(test_final_feat)
-        col_pred = models[col].predict(test_pool)
-        submission[col.replace("_mean", "")] = col_pred
-
+        submission[col.replace("_mean", "")] = all_test_preds[col]
     submission.to_csv(output_csv, index=False)
     submission.head()

@@ -2,5 +2,6 @@
 **/catboost_info/**
 **/embeddings/**
 **/submissions/**
+**/lightning_logs/**
 
 run.sh
