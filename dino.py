@@ -10,6 +10,7 @@ from tqdm import tqdm
 from torchvision import transforms
 from sklearn.metrics import r2_score
 from catboost import Pool, CatBoostRegressor
+from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 
 
@@ -76,6 +77,7 @@ if __name__ == "__main__":
     parser.add_argument("--filter_low", type=float, default=0.001)
     parser.add_argument("--filter_high", type=float, default=0.981)
     parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--use_auxiliary", action="store_true")
     args = parser.parse_args()
 
     seed_all(args.seed)
@@ -118,6 +120,18 @@ if __name__ == "__main__":
         print(f"{subset} \t| # Masked Samples: {n_masked}")
         print(f"{subset} \t| % Masked Samples: {perc_masked:.3f}%")
 
+    if args.use_auxiliary:
+        FEATURE_SCALER = StandardScaler()
+        train_features_mask = FEATURE_SCALER.fit_transform(
+            train_mask[feature_columns].values.astype(np.float32)
+        )
+        val_features_mask = FEATURE_SCALER.transform(
+            val_mask[feature_columns].values.astype(np.float32)
+        )
+        test_features = FEATURE_SCALER.transform(
+            test[feature_columns].values.astype(np.float32)
+        )
+
     emb_dir = Path(args.embedding_dir) / "dinov2_vitg14_reg"
     emb_dir.mkdir(exist_ok=True, parents=True)
     train_emb_path = emb_dir / "train.npy"
@@ -156,9 +170,12 @@ if __name__ == "__main__":
     val_final_feat = np.load(valid_emb_path)[mask_val]
     test_final_feat = np.load(test_emb_path)
 
-    train_features_mask_df = pd.DataFrame(train_image_embeddings)
-    val_features_mask_df = pd.DataFrame(val_image_embeddings)
-    test_features_mask_df = pd.DataFrame(test_image_embeddings)
+    if args.use_auxiliary:
+        train_final_feat = np.concatenate(
+            (train_features_mask, train_final_feat), axis=1
+        )
+        val_final_feat = np.concatenate((val_features_mask, val_final_feat), axis=1)
+        test_final_feat = np.concatenate((test_features, test_final_feat), axis=1)
 
     models = {}
     scores = {}
@@ -168,8 +185,8 @@ if __name__ == "__main__":
     for i, col in tqdm(enumerate(TARGET_COLUMNS), total=len(TARGET_COLUMNS)):
         y_curr = y_train_mask[:, i]
         y_curr_val = y_val_mask[:, i]
-        train_pool = Pool(train_features_mask_df, y_curr)
-        val_pool = Pool(val_features_mask_df, y_curr_val)
+        train_pool = Pool(train_final_feat, y_curr)
+        val_pool = Pool(val_final_feat, y_curr_val)
 
         # tried to tune these parameters but without real success
         model = CatBoostRegressor(
@@ -195,7 +212,7 @@ if __name__ == "__main__":
     submission.columns = submission.columns.str.replace("_mean", "")
 
     for i, col in enumerate(TARGET_COLUMNS):
-        test_pool = Pool(test_features_mask_df)
+        test_pool = Pool(test_final_feat)
         col_pred = models[col].predict(test_pool)
         submission[col.replace("_mean", "")] = col_pred
 
