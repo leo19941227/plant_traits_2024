@@ -82,6 +82,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--use_auxiliary", action="store_true")
     parser.add_argument("--filter_outlier", action="store_true")
+    parser.add_argument("--n_iter", type=int, default=1500)
+    parser.add_argument("--lr", type=float, default=0.06)
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
@@ -196,8 +198,8 @@ if __name__ == "__main__":
 
         # tried to tune these parameters but without real success
         model = CatBoostRegressor(
-            iterations=1500,
-            learning_rate=0.06,
+            iterations=args.n_iter,
+            learning_rate=args.lr,
             loss_function="RMSE",
             verbose=0,
             random_state=args.seed,
